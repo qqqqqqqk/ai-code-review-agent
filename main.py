@@ -7,7 +7,7 @@ AI Code Review Agent
 import hmac
 import hashlib
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from config import GITHUB_TOKEN, DEEPSEEK_API_KEY, WEBHOOK_SECRET
 
 app = FastAPI(title="AI Code Review Agent")
@@ -16,26 +16,30 @@ app = FastAPI(title="AI Code Review Agent")
 # 1. 接收 GitHub Webhook
 # ─────────────────────────────────────────
 @app.post("/webhook")
-async def handle_webhook(request: Request):
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks): # 2. 注入参数
     """GitHub 有 PR 事件时，会 POST 到这里"""
 
-    # 验证请求确实来自 GitHub（安全校验）
     body = await request.body()
     verify_github_signature(body, request.headers.get("X-Hub-Signature-256", ""))
 
     data = await request.json()
     event = request.headers.get("X-GitHub-Event")
+    action = data.get("action")
+    print(f"[收到 Webhook 原始请求] Event: {event}, Action: {action}")
 
     # 只处理 PR 被打开 或 有新提交 的事件
-    if event == "pull_request" and data.get("action") in ["opened", "synchronize"]:
+    if event == "pull_request" and action in ["opened", "synchronize"]:
         pr_number = data["pull_request"]["number"]
         repo      = data["repository"]["full_name"]
         pr_title  = data["pull_request"]["title"]
 
         print(f"[收到事件] PR #{pr_number}: {pr_title} ({repo})")
 
-        # 异步处理，不让 GitHub 等太久
-        await process_pull_request(repo, pr_number)
+        # ❌ 删掉这行旧的：await process_pull_request(repo, pr_number)
+        
+        #  改成真正的后台任务！秒回 GitHub，不让对方死等
+        background_tasks.add_task(process_pull_request, repo, pr_number)
+        print(f"[后台任务已挂载] PR #{pr_number} 已移交后台异步处理")
 
     return {"status": "ok"}
 
@@ -45,38 +49,52 @@ async def handle_webhook(request: Request):
 # ─────────────────────────────────────────
 async def process_pull_request(repo: str, pr_number: int):
     """完整流程：拉代码 → AI分析 → 回复评论"""
+    try:
+        print(f"[开始分析] {repo} PR #{pr_number}")
 
-    print(f"[开始分析] {repo} PR #{pr_number}")
+        files = await get_pr_files(repo, pr_number)
+        if not files:
+            print("[跳过] 没有文件改动")
+            return
 
-    # 2.1 通过 GitHub API 拿到改动的文件列表
-    files = await get_pr_files(repo, pr_number)
-    if not files:
-        print("[跳过] 没有文件改动")
-        return
+        code_diff = format_code_diff(files)
+        print(f"[DEBUG] 成功获取 Diff 文本，长度: {len(code_diff)}，准备调用 DeepSeek...")
 
-    # 2.2 把改动内容整理成文本，喂给 AI
-    code_diff = format_code_diff(files)
+        review = await ask_deepseek_for_review(code_diff)
+        print(f"[DEBUG] DeepSeek 成功返回 Review 内容！")
 
-    # 2.3 调用 DeepSeek 做 Code Review
-    review = await ask_deepseek_for_review(code_diff)
-
-    # 2.4 把 AI 的意见，以评论形式回复到 PR
-    await post_pr_comment(repo, pr_number, review)
-    print(f"[完成] PR #{pr_number} Code Review 已发布")
-
+        await post_pr_comment(repo, pr_number, review)
+        print(f"[完成] PR #{pr_number} Code Review 已发布")
+        
+    except Exception as e:
+        # 如果后台报错了，这里一定会打印出堆栈！
+        print(f"❌❌❌ [后台任务崩溃] 原因: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 async def get_pr_files(repo: str, pr_number: int) -> list:
     """调用 GitHub API，获取 PR 改动的文件"""
+    if not GITHUB_TOKEN:
+        print("⚠️ [错误] 未配置 GITHUB_TOKEN，无法获取 PR 文件列表。请检查环境变量或 .env 文件。")
+        return []
+
     url     = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
+        "User-Agent": "AI-Code-Review-Agent",
         "Accept": "application/vnd.github.v3+json"
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as e:
+        print(f"❌ [GitHub API 异常] 获取 PR 文件列表失败，状态码: {e.response.status_code}，详情: {e.response.text}")
+    except Exception as e:
+        print(f"❌ [请求异常] 获取 PR 文件列表时发生未知错误: {e}")
+    return []
 
 
 def format_code_diff(files: list) -> str:
@@ -95,6 +113,9 @@ def format_code_diff(files: list) -> str:
 # ─────────────────────────────────────────
 async def ask_deepseek_for_review(code_diff: str) -> str:
     """把代码改动发给 DeepSeek，返回 Review 意见"""
+    if not DEEPSEEK_API_KEY:
+        print("⚠️ [错误] 未配置 DEEPSEEK_API_KEY，无法调用 AI 服务。请检查环境变量或 .env 文件。")
+        return "⚠️ 未配置 DEEPSEEK_API_KEY，无法调用 AI 服务进行审查。"
 
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
@@ -130,11 +151,23 @@ async def ask_deepseek_for_review(code_diff: str) -> str:
         "max_tokens": 1024
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=payload, timeout=60.0)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+    except httpx.HTTPStatusError as e:
+        err_msg = f"DeepSeek API 请求失败，状态码: {e.response.status_code}"
+        try:
+            err_msg += f"，详情: {e.response.json().get('error', {}).get('message')}"
+        except Exception:
+            err_msg += f"，详情: {e.response.text}"
+        print(f"❌ {err_msg}")
+        return f"❌ AI 审查服务异常: {err_msg}"
+    except Exception as e:
+        print(f"❌ [DeepSeek 请求异常] 调用 DeepSeek 失败: {e}")
+        return f"❌ 调用 DeepSeek 发生异常: {str(e)}"
 
 
 # ─────────────────────────────────────────
@@ -142,18 +175,28 @@ async def ask_deepseek_for_review(code_diff: str) -> str:
 # ─────────────────────────────────────────
 async def post_pr_comment(repo: str, pr_number: int, comment: str):
     """通过 GitHub API，在 PR 下面发一条评论"""
+    if not GITHUB_TOKEN:
+        print("⚠️ [错误] 未配置 GITHUB_TOKEN，无法发表 PR 评论。")
+        return
+
     url     = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
+        "User-Agent": "AI-Code-Review-Agent",
         "Accept": "application/vnd.github.v3+json"
     }
     body = {
         "body": f"## 🤖 AI Code Review\n\n{comment}\n\n---\n*由 AI Agent 自动生成*"
     }
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, headers=headers, json=body)
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        print(f"❌ [GitHub API 异常] 发布 PR 评论失败，状态码: {e.response.status_code}，详情: {e.response.text}")
+    except Exception as e:
+        print(f"❌ [请求异常] 发布 PR 评论时发生未知错误: {e}")
 
 
 # ─────────────────────────────────────────
