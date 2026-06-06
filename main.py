@@ -7,7 +7,7 @@ AI Code Review Agent
 import hmac
 import hashlib
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from config import GITHUB_TOKEN, DEEPSEEK_API_KEY, WEBHOOK_SECRET
 
 app = FastAPI(title="AI Code Review Agent")
@@ -16,17 +16,15 @@ app = FastAPI(title="AI Code Review Agent")
 # 1. 接收 GitHub Webhook
 # ─────────────────────────────────────────
 @app.post("/webhook")
-async def handle_webhook(request: Request):
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks): # 2. 注入参数
     """GitHub 有 PR 事件时，会 POST 到这里"""
 
-    # 验证请求确实来自 GitHub（安全校验）
     body = await request.body()
     verify_github_signature(body, request.headers.get("X-Hub-Signature-256", ""))
 
     data = await request.json()
     event = request.headers.get("X-GitHub-Event")
 
-    # 只处理 PR 被打开 或 有新提交 的事件
     if event == "pull_request" and data.get("action") in ["opened", "synchronize"]:
         pr_number = data["pull_request"]["number"]
         repo      = data["repository"]["full_name"]
@@ -34,8 +32,11 @@ async def handle_webhook(request: Request):
 
         print(f"[收到事件] PR #{pr_number}: {pr_title} ({repo})")
 
-        # 异步处理，不让 GitHub 等太久
-        await process_pull_request(repo, pr_number)
+        # ❌ 删掉这行旧的：await process_pull_request(repo, pr_number)
+        
+        #  改成真正的后台任务！秒回 GitHub，不让对方死等
+        background_tasks.add_task(process_pull_request, repo, pr_number)
+        print(f"[后台任务已挂载] PR #{pr_number} 已移交后台异步处理")
 
     return {"status": "ok"}
 
@@ -45,25 +46,28 @@ async def handle_webhook(request: Request):
 # ─────────────────────────────────────────
 async def process_pull_request(repo: str, pr_number: int):
     """完整流程：拉代码 → AI分析 → 回复评论"""
+    try:
+        print(f"[开始分析] {repo} PR #{pr_number}")
 
-    print(f"[开始分析] {repo} PR #{pr_number}")
+        files = await get_pr_files(repo, pr_number)
+        if not files:
+            print("[跳过] 没有文件改动")
+            return
 
-    # 2.1 通过 GitHub API 拿到改动的文件列表
-    files = await get_pr_files(repo, pr_number)
-    if not files:
-        print("[跳过] 没有文件改动")
-        return
+        code_diff = format_code_diff(files)
+        print(f"[DEBUG] 成功获取 Diff 文本，长度: {len(code_diff)}，准备调用 DeepSeek...")
 
-    # 2.2 把改动内容整理成文本，喂给 AI
-    code_diff = format_code_diff(files)
+        review = await ask_deepseek_for_review(code_diff)
+        print(f"[DEBUG] DeepSeek 成功返回 Review 内容！")
 
-    # 2.3 调用 DeepSeek 做 Code Review
-    review = await ask_deepseek_for_review(code_diff)
-
-    # 2.4 把 AI 的意见，以评论形式回复到 PR
-    await post_pr_comment(repo, pr_number, review)
-    print(f"[完成] PR #{pr_number} Code Review 已发布")
-
+        await post_pr_comment(repo, pr_number, review)
+        print(f"[完成] PR #{pr_number} Code Review 已发布")
+        
+    except Exception as e:
+        # 如果后台报错了，这里一定会打印出堆栈！
+        print(f"❌❌❌ [后台任务崩溃] 原因: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 async def get_pr_files(repo: str, pr_number: int) -> list:
     """调用 GitHub API，获取 PR 改动的文件"""
